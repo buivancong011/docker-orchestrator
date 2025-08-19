@@ -120,7 +120,7 @@ EOF
 # =========================
 # 7. Daily refresh service & timer
 # =========================
-curl -sSL https://raw.githubusercontent.com/buivancong011/docker-orchestrator/main/bin/apps-daily-refresh.sh -o /usr/local/bin/apps-daily-refresh.sh
+curl -sSL https://raw.githubusercontent.com/buivancong011/docker-orchestrator/refs/heads/main/apps-daily-refresh.sh -o /usr/local/bin/apps-daily-refresh.sh
 chmod +x /usr/local/bin/apps-daily-refresh.sh
 
 cat >/etc/systemd/system/apps-daily-refresh.service <<'EOF'
