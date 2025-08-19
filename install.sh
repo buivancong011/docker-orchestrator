@@ -1,262 +1,187 @@
-﻿sudo bash -c '
-set -Eeuo pipefail
+#!/bin/bash
+set -e
 
-# ===== Config =====
-IFACE="${IFACE:-ens5}"
-NET1="my_network_1"; SUBNET1="192.168.33.0/24"
-NET2="my_network_2"; SUBNET2="192.168.34.0/24"
-START_SH="/usr/local/bin/docker-apps-start.sh"
-REFRESH_SH="/usr/local/bin/apps-daily-refresh.sh"
-UNIT="/etc/systemd/system/docker-apps.service"
+echo "=== 🚀 Docker Orchestrator Installer ==="
 
-# ===== Check deps =====
-need(){ command -v "$1" >/dev/null || { echo "Thiếu lệnh: $1"; exit 1; }; }
-need ip; need iptables
-command -v docker >/dev/null || { echo "Docker chưa có, hãy cài trước."; exit 1; }
+# =========================
+# 1. Remove unwanted packages
+# =========================
+echo "[INFO] 🔄 Removing squid & httpd-tools if present..."
+yum remove -y squid httpd-tools || true
+apt remove -y squid httpd-tools || true
 
-# Bật docker khi khởi động & đảm bảo đang chạy
-systemctl enable docker --now >/dev/null 2>&1 || true
-
-# ===== Helper lấy IP ổn định =====
-get_ip_secondary(){ ip -4 addr show dev "$IFACE" | awk "/inet .*noprefixroute/ {print \$2}" | sed "s#/.*##" | head -n1; }
-get_ip_primary()  { ip -4 addr show dev "$IFACE" | awk "/inet .*dynamic/      {print \$2}" | sed "s#/.*##" | head -n1; }
-IP_ALLA="$(get_ip_secondary || true)"
-IP_ALLB="$(get_ip_primary   || true)"
-if [[ -z "$IP_ALLA" || -z "$IP_ALLB" ]]; then
-  mapfile -t IP_LINES < <(ip -4 -o addr show dev "$IFACE" | awk "{print \$4}" | sed "s#/.*##")
-  IP_ALLA="${IP_ALLA:-${IP_LINES[0]:-}}"
-  IP_ALLB="${IP_ALLB:-${IP_LINES[1]:-${IP_LINES[0]:-}}}"
+# =========================
+# 2. Install Docker if missing
+# =========================
+if ! command -v docker &> /dev/null; then
+  echo "[INFO] 🐳 Installing Docker..."
+  curl -fsSL https://get.docker.com | sh
+  systemctl enable docker
+  systemctl start docker
+  echo "[INFO] 🔁 Rebooting system after Docker install..."
+  reboot
+  exit 0
+else
+  echo "[INFO] ✅ Docker already installed."
 fi
-[[ -n "$IP_ALLA" && -n "$IP_ALLB" ]] || { echo "Không lấy được IP trên $IFACE"; exit 1; }
-echo "[INFO] Sẽ dùng IP_ALLA=$IP_ALLA (secondary) | IP_ALLB=$IP_ALLB (primary)"
 
-# ===== /usr/local/bin/docker-apps-start.sh =====
-cat > "$START_SH" << "EOSH"
-#!/usr/bin/env bash
-set -Eeuo pipefail
-log(){ echo "[`date +%F_%T`] $*"; }
+# =========================
+# 3. Create Docker networks
+# =========================
+echo "[INFO] 🌐 Creating Docker networks..."
+docker network create my_network_1 --driver bridge --subnet 192.168.33.0/24 || true
+docker network create my_network_2 --driver bridge --subnet 192.168.34.0/24 || true
 
-# Khớp cấu hình
-IFACE="${IFACE:-ens5}"
-NET1="my_network_1"; SUBNET1="192.168.33.0/24"
-NET2="my_network_2"; SUBNET2="192.168.34.0/24"
+# =========================
+# 4. Setup iptables NAT + SNAT
+# =========================
+IP_ALLA=$(/sbin/ip -4 -o addr show scope global noprefixroute | awk '{gsub(/\/.*/,"",$4); print $4; exit}')
+IP_ALLB=$(/sbin/ip -4 -o addr show scope global dynamic | awk '{gsub(/\/.*/,"",$4); print $4; exit}')
 
-# ⚠ Secrets (khuyến nghị tách .env nếu public)
-TM_TOKEN="JoaF9KjqyUjmIUCOMxx6W/6rKD0Q0XTHQ5zlqCEJlXM="
-RP_EMAIL="nguyenvinhson000@gmail.com"
-RP_KEY="cad6dcce-d038-4727-969b-d996ed80d3ef"
-EARNFM_TOKEN="50f04bbe-94d9-4f6a-82b9-b40016bd4bbb"
-UR_USER="nguyenvinhcao123@gmail.com"
-UR_PASS="CAOcao123CAO@"
-URN_IMAGE="ghcr.io/techroy23/docker-urnetwork:2025.8.11-701332070@sha256:9feae0bfb50545b310bedae8937dc076f1d184182f0c47c14b5ba2244be3ed7a"
+echo "[INFO] 🔒 Setting iptables rules..."
+iptables -t nat -C POSTROUTING -s 192.168.33.0/24 -j SNAT --to-source ${IP_ALLA} 2>/dev/null || \
+iptables -t nat -I POSTROUTING -s 192.168.33.0/24 -j SNAT --to-source ${IP_ALLA}
 
-# IP helpers
-get_ip_secondary(){ ip -4 addr show dev "$IFACE" | awk "/inet .*noprefixroute/ {print \$2}" | sed "s#/.*##" | head -n1; }
-get_ip_primary()  { ip -4 addr show dev "$IFACE" | awk "/inet .*dynamic/      {print \$2}" | sed "s#/.*##" | head -n1; }
+iptables -t nat -C POSTROUTING -s 192.168.34.0/24 -j SNAT --to-source ${IP_ALLB} 2>/dev/null || \
+iptables -t nat -I POSTROUTING -s 192.168.34.0/24 -j SNAT --to-source ${IP_ALLB}
 
-IP_ALLA="$(get_ip_secondary || true)"
-IP_ALLB="$(get_ip_primary   || true)"
-if [[ -z "$IP_ALLA" || -z "$IP_ALLB" ]]; then
-  mapfile -t IP_LINES < <(ip -4 -o addr show dev "$IFACE" | awk "{print \$4}" | sed "s#/.*##")
-  IP_ALLA="${IP_ALLA:-${IP_LINES[0]:-}}"
-  IP_ALLB="${IP_ALLB:-${IP_LINES[1]:-${IP_LINES[0]:-}}}"
-fi
-[[ -n "$IP_ALLA" && -n "$IP_ALLB" ]] || { log "Không lấy được IP"; exit 1; }
-log "IP_ALLA=$IP_ALLA  IP_ALLB=$IP_ALLB"
+# =========================
+# 5. Create startup script
+# =========================
+echo "[INFO] 📝 Creating docker-apps-start.sh..."
+cat >/usr/local/bin/docker-apps-start.sh <<'EOF'
+#!/bin/bash
+set -e
+sleep 30
+echo "[INFO] 🚀 Starting all containers..."
 
-# Networks (idempotent)
-docker network inspect "$NET1" >/dev/null 2>&1 || docker network create --driver bridge --subnet "$SUBNET1" "$NET1"
-docker network inspect "$NET2" >/dev/null 2>&1 || docker network create --driver bridge --subnet "$SUBNET2" "$NET2"
-
-# iptables NAT (idempotent)
-iptables -t nat -C POSTROUTING -s "$SUBNET1" -j SNAT --to-source "$IP_ALLA" 2>/dev/null || \
-iptables -t nat -A POSTROUTING -s "$SUBNET1" -j SNAT --to-source "$IP_ALLA"
-iptables -t nat -C POSTROUTING -s "$SUBNET2" -j SNAT --to-source "$IP_ALLB" 2>/dev/null || \
-iptables -t nat -A POSTROUTING -s "$SUBNET2" -j SNAT --to-source "$IP_ALLB"
-
-# Dọn containers cũ
-docker rm -f myst1 myst2 tm1 tm2 repocket1 repocket2 earnfm1 earnfm2 packetsdk1 packetsdk2 ur1 ur2 >/dev/null 2>&1 || true
-
-# Pull images
-docker pull mysteriumnetwork/myst:latest
-docker pull traffmonetizer/cli_v2:arm64v8
-docker pull repocket/repocket:latest
-docker pull earnfm/earnfm-client:latest
-docker pull packetsdk/packetsdk:latest
-docker pull "$URN_IMAGE"
-
-# Myst (map port 4449 theo IP host tương ứng)
-docker run -d --network "$NET1" --cap-add NET_ADMIN -p "${IP_ALLA}:4449:4449" \
-  --name myst1 -v myst-data1:/var/lib/mysterium-node --restart unless-stopped \
-  mysteriumnetwork/myst:latest service --agreed-terms-and-conditions
-docker run -d --network "$NET2" --cap-add NET_ADMIN -p "${IP_ALLB}:4449:4449" \
-  --name myst2 -v myst-data2:/var/lib/mysterium-node --restart unless-stopped \
-  mysteriumnetwork/myst:latest service --agreed-terms-and-conditions
-
-# TraffMonetizer
-docker run -d --network "$NET1" --restart=always --name tm1 \
-  traffmonetizer/cli_v2:arm64v8 start accept --token "$TM_TOKEN"
-docker run -d --network "$NET2" --restart=always --name tm2 \
-  traffmonetizer/cli_v2:arm64v8 start accept --token "$TM_TOKEN"
+# Traffmonetizer
+docker run -d --network my_network_1 --restart always --name tm1 traffmonetizer/cli_v2:arm64v8 start accept --token YOUR_TOKEN
+docker run -d --network my_network_2 --restart always --name tm2 traffmonetizer/cli_v2:arm64v8 start accept --token YOUR_TOKEN
 
 # Repocket
-docker run -d --network "$NET1" --restart=always --name repocket1 \
-  -e RP_EMAIL="$RP_EMAIL" -e RP_API_KEY="$RP_KEY" repocket/repocket:latest
-docker run -d --network "$NET2" --restart=always --name repocket2 \
-  -e RP_EMAIL="$RP_EMAIL" -e RP_API_KEY="$RP_KEY" repocket/repocket:latest
+docker run -d --network my_network_1 --name repocket1 -e RP_EMAIL=your@email -e RP_API_KEY=your_key --restart=always repocket/repocket:latest
+docker run -d --network my_network_2 --name repocket2 -e RP_EMAIL=your@email -e RP_API_KEY=your_key --restart=always repocket/repocket:latest
+
+# Mysterium
+IP_ALLA=$(/sbin/ip -4 -o addr show scope global noprefixroute | awk '{gsub(/\/.*/,"",$4); print $4; exit}')
+IP_ALLB=$(/sbin/ip -4 -o addr show scope global dynamic | awk '{gsub(/\/.*/,"",$4); print $4; exit}')
+docker run -d --network my_network_1 --cap-add NET_ADMIN -p ${IP_ALLA}:4449:4449 --name myst1 -v myst-data1:/var/lib/mysterium-node --restart unless-stopped mysteriumnetwork/myst:latest service --agreed-terms-and-conditions
+docker run -d --network my_network_2 --cap-add NET_ADMIN -p ${IP_ALLB}:4449:4449 --name myst2 -v myst-data2:/var/lib/mysterium-node --restart unless-stopped mysteriumnetwork/myst:latest service --agreed-terms-and-conditions
 
 # EarnFM
-docker run -d --network "$NET1" --restart=always --name earnfm1 \
-  -e EARNFM_TOKEN="$EARNFM_TOKEN" earnfm/earnfm-client:latest
-docker run -d --network "$NET2" --restart=always --name earnfm2 \
-  -e EARNFM_TOKEN="$EARNFM_TOKEN" earnfm/earnfm-client:latest
+docker run -d --network my_network_1 --restart=always -e EARNFM_TOKEN="YOUR_EARNFM_TOKEN" --name earnfm1 earnfm/earnfm-client:latest 
+docker run -d --network my_network_2 --restart=always -e EARNFM_TOKEN="YOUR_EARNFM_TOKEN" --name earnfm2 earnfm/earnfm-client:latest 
 
 # PacketSDK
-docker run -d --network "$NET1" --restart unless-stopped --name packetsdk1 \
-  packetsdk/packetsdk -appkey=BFwbNdFfwgcDdRmj
-docker run -d --network "$NET2" --restart unless-stopped --name packetsdk2 \
-  packetsdk/packetsdk -appkey=BFwbNdFfwgcDdRmj
+docker run -d --network my_network_1 --restart unless-stopped --name packetsdk1 packetsdk/packetsdk -appkey=YOUR_APPKEY
+docker run -d --network my_network_2 --restart unless-stopped --name packetsdk2 packetsdk/packetsdk -appkey=YOUR_APPKEY
 
-# URNetwork
-docker run -d --network "$NET1" --restart=always --cap-add NET_ADMIN --name ur1 \
-  -e USER_AUTH="$UR_USER" -e PASSWORD="$UR_PASS" "$URN_IMAGE"
-docker run -d --network "$NET2" --restart=always --cap-add NET_ADMIN --name ur2 \
-  -e USER_AUTH="$UR_USER" -e PASSWORD="$UR_PASS" "$URN_IMAGE"
+# UR Network
+docker run -d --network my_network_1 --restart=always --cap-add NET_ADMIN --platform linux/arm64 --name ur1 -e USER_AUTH="youruser" -e PASSWORD="yourpass" ghcr.io/techroy23/docker-urnetwork:latest
+docker run -d --network my_network_2 --restart=always --cap-add NET_ADMIN --platform linux/arm64 --name ur2 -e USER_AUTH="youruser" -e PASSWORD="yourpass" ghcr.io/techroy23/docker-urnetwork:latest
 
-log "✅ All Docker apps started."
-EOSH
-chmod +x "$START_SH"
-
-# ===== /usr/local/bin/apps-daily-refresh.sh =====
-cat > "$REFRESH_SH" << "EOF"
-#!/usr/bin/env bash
-set -Eeuo pipefail
-log(){ echo "[$(date +%F_%T)] $*"; }
-
-NET1="my_network_1"
-NET2="my_network_2"
-RP_EMAIL="nguyenvinhson000@gmail.com"
-RP_KEY="cad6dcce-d038-4727-969b-d996ed80d3ef"
-EARNFM_TOKEN="50f04bbe-94d9-4f6a-82b9-b40016bd4bbb"
-URN_IMAGE="ghcr.io/techroy23/docker-urnetwork:2025.8.11-701332070@sha256:9feae0bfb50545b310bedae8937dc076f1d184182f0c47c14b5ba2244be3ed7a"
-
-log "Daily refresh: recreate Repocket/EarnFM, restart UR"
-
-docker rm -f repocket1 repocket2 earnfm1 earnfm2 >/dev/null 2>&1 || true
-docker pull repocket/repocket:latest >/dev/null || true
-docker pull earnfm/earnfm-client:latest >/dev/null 2>&1 || true
-
-docker run -d --network "$NET1" --name repocket1 \
-  -e RP_EMAIL="$RP_EMAIL" -e RP_API_KEY="$RP_KEY" --restart=always repocket/repocket:latest
-docker run -d --network "$NET2" --name repocket2 \
-  -e RP_EMAIL="$RP_EMAIL" -e RP_API_KEY="$RP_KEY" --restart=always repocket/repocket:latest
-
-docker run -d --network "$NET1" --restart=always \
-  -e EARNFM_TOKEN="$EARNFM_TOKEN" --name earnfm1 earnfm/earnfm-client:latest
-docker run -d --network "$NET2" --restart=always \
-  -e EARNFM_TOKEN="$EARNFM_TOKEN" --name earnfm2 earnfm/earnfm-client:latest
-
-docker pull "$URN_IMAGE" >/dev/null 2>&1 || true
-docker restart ur1 >/dev/null 2>&1 || true
-docker restart ur2 >/dev/null 2>&1 || true
-
-log "Daily refresh done."
+echo "[INFO] ✅ All containers started."
 EOF
-chmod +x "$REFRESH_SH"
 
-# ===== docker-apps.service =====
-cat > "$UNIT" <<EOF
+chmod +x /usr/local/bin/docker-apps-start.sh
+
+# =========================
+# 6. Systemd service for Docker Apps
+# =========================
+cat >/etc/systemd/system/docker-apps.service <<'EOF'
 [Unit]
 Description=Docker Apps Auto Start
-After=network-online.target docker.service
-Wants=network-online.target
+After=docker.service
 Requires=docker.service
 
 [Service]
 Type=oneshot
-ExecStart=$START_SH
+ExecStart=/usr/local/bin/docker-apps-start.sh
 RemainAfterExit=yes
-StandardOutput=journal
-StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# ===== Timer: delay 30s sau khi boot mới chạy docker-apps.service =====
-cat > /etc/systemd/system/docker-apps-boot.timer <<EOF
+# Timer để delay 30s
+cat >/etc/systemd/system/docker-apps-boot.timer <<'EOF'
 [Unit]
-Description=Delay 30s after boot then start docker-apps.service
+Description=Run docker-apps.service 30s after boot
 
 [Timer]
-OnBootSec=30s
+OnBootSec=30
 Unit=docker-apps.service
-Persistent=false
-AccuracySec=1s
 
 [Install]
 WantedBy=timers.target
 EOF
 
-# ===== apps-daily-refresh.service + timer (03:20 UTC hàng ngày) =====
-cat > /etc/systemd/system/apps-daily-refresh.service <<EOF
+# =========================
+# 7. Daily refresh service & timer
+# =========================
+curl -sSL https://raw.githubusercontent.com/buivancong011/docker-orchestrator/main/bin/apps-daily-refresh.sh -o /usr/local/bin/apps-daily-refresh.sh
+chmod +x /usr/local/bin/apps-daily-refresh.sh
+
+cat >/etc/systemd/system/apps-daily-refresh.service <<'EOF'
 [Unit]
-Description=Apps Daily Refresh (repocket/earnfm recreate, UR restart)
-Wants=network-online.target
-After=network-online.target docker.service
+Description=Apps Daily Refresh
+After=docker.service
 Requires=docker.service
 
 [Service]
 Type=oneshot
-ExecStart=$REFRESH_SH
-StandardOutput=journal
-StandardError=journal
+ExecStart=/usr/local/bin/apps-daily-refresh.sh
 EOF
 
-cat > /etc/systemd/system/apps-daily-refresh.timer <<EOF
+cat >/etc/systemd/system/apps-daily-refresh.timer <<'EOF'
 [Unit]
-Description=Timer for Apps Daily Refresh (03:20 UTC daily)
+Description=Run Apps Daily Refresh once per day
 
 [Timer]
-OnCalendar=*-*-* 03:20:00 UTC
-Persistent=true
-AccuracySec=1min
+OnCalendar=*-*-* 03:20:00
+Unit=apps-daily-refresh.service
 
 [Install]
 WantedBy=timers.target
 EOF
 
-# ===== weekly-reboot.service + timer (03:10 UTC mỗi Thứ Hai) =====
-cat > /etc/systemd/system/weekly-reboot.service <<EOF
+# =========================
+# 8. Weekly reboot service & timer
+# =========================
+cat >/etc/systemd/system/weekly-reboot.service <<'EOF'
 [Unit]
-Description=Weekly Reboot (03:10 UTC every Monday)
-After=network-online.target
-Wants=network-online.target
+Description=Weekly Reboot
 
 [Service]
 Type=oneshot
 ExecStart=/sbin/reboot
 EOF
 
-cat > /etc/systemd/system/weekly-reboot.timer <<EOF
+cat >/etc/systemd/system/weekly-reboot.timer <<'EOF'
 [Unit]
-Description=Timer for Weekly Reboot (03:10 UTC every Monday)
+Description=Reboot every 7 days
 
 [Timer]
-OnCalendar=Mon *-*-* 03:10:00 UTC
-Persistent=true
-AccuracySec=1min
+OnCalendar=Mon *-*-* 03:10:00
+Unit=weekly-reboot.service
 
 [Install]
 WantedBy=timers.target
 EOF
 
-# ===== Enable timers =====
+# =========================
+# 9. Enable all services & timers
+# =========================
+systemctl daemon-reexec
 systemctl daemon-reload
-# Không enable docker-apps.service trực tiếp; để timer gọi sau boot 30s
-systemctl enable --now docker-apps-boot.timer apps-daily-refresh.timer weekly-reboot.timer
+systemctl enable docker-apps.service
+systemctl enable docker-apps-boot.timer
+systemctl enable apps-daily-refresh.timer
+systemctl enable weekly-reboot.timer
 
-echo "✅ Hoàn tất: tạo scripts, service, boot-delay 30s, daily refresh timer & weekly reboot timer."
-echo "👉 Kiểm tra timers: systemctl list-timers --all | grep -E \"docker-apps-boot|apps-daily-refresh|weekly-reboot\""
-echo "👉 Xem log khởi tạo apps: journalctl -u docker-apps.service -e --no-pager"
-'
+systemctl start docker-apps-boot.timer
+systemctl start apps-daily-refresh.timer
+systemctl start weekly-reboot.timer
+
+echo "=== ✅ Install completed. Check with: systemctl list-timers ==="
