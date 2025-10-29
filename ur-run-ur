@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ============= CONFIG =============
+IMAGE="${IMAGE:-bringyour/community-provider:g4-latest}"
+SBOX_PREFIX="${SBOX_PREFIX:-csbox}"      # csbox1, csbox2, ...
+UR_PREFIX="${UR_PREFIX:-ur-}"            # ur-csboxN
+JWT_DIR_BASE="${JWT_DIR_BASE:-$HOME}"    # nơi lưu ~/.urnetwork-<sbox>/jwt
+
+PULL_ON_START="${PULL_ON_START:-false}"  # để false, update thủ công
+LOG_MAX_SIZE="${LOG_MAX_SIZE:-10m}"
+LOG_MAX_FILE="${LOG_MAX_FILE:-3}"
+RECREATE_DELAY="${RECREATE_DELAY:-2}"
+
+# ============= UTILS =============
+die(){ echo "[ERR] $*" >&2; exit 1; }
+info(){ echo "[INFO] $*"; }
+warn(){ echo "⚠ $*"; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "Thiếu lệnh '$1'."; }
+
+discover_sboxes(){
+  docker ps -a --format '{{.Names}}' | awk -v pfx="^${SBOX_PREFIX}[0-9]+$" '$0 ~ pfx' | sort -V
+}
+jwt_dir_for_sbox(){ echo "${JWT_DIR_BASE}/.urnetwork-$1"; }
+jwt_file_for_sbox(){ echo "$(jwt_dir_for_sbox "$1")/jwt"; }
+container_name_for_sbox(){ echo "${UR_PREFIX}$1"; }
+
+pull_image(){
+  [[ "$PULL_ON_START" != true ]] && return 0
+  info "Pull image $IMAGE ..."
+  docker pull "$IMAGE" >/dev/null || warn "Pull image thất bại (bỏ qua do cấu hình)."
+}
+
+run_or_restart_for_sbox(){
+  local s="$1" cname jwt_dir jwt_file st
+  cname="$(container_name_for_sbox "$s")"
+  jwt_dir="$(jwt_dir_for_sbox "$s")"
+  jwt_file="$(jwt_file_for_sbox "$s")"
+
+  if [[ ! -s "$jwt_file" ]]; then
+    warn "$s: thiếu JWT ($jwt_file) → bỏ qua route này. Hãy chạy: ur-get-jwts up"
+    return 0
+  fi
+
+  st="$(docker inspect -f '{{.State.Status}}' "$s" 2>/dev/null || true)"
+  if [[ "$st" != "running" ]]; then
+    warn "$s không running → bỏ qua (UR cần net=container:$s)."
+    return 0
+  fi
+
+  docker rm -f "$cname" >/dev/null 2>&1 || true
+  sleep "$RECREATE_DELAY"
+
+  docker run -d --name "$cname" \
+    --restart=always \
+    --log-opt "max-size=${LOG_MAX_SIZE}" --log-opt "max-file=${LOG_MAX_FILE}" \
+    --network "container:${s}" \
+    -v "${jwt_dir}:/root/.urnetwork" \
+    "$IMAGE" provide >/dev/null
+
+  info "✔ $cname (net=container:$s) đã start"
+  sleep "$RECREATE_DELAY"
+}
+
+# ============= COMMANDS =============
+usage(){
+  cat <<'EOF'
+Usage:
+  ur-run-ur up        # Khởi chạy toàn bộ ur-csboxN (chỉ khi đã có ~/.urnetwork-<sbox>/jwt)
+  ur-run-ur down      # Xoá toàn bộ ur-csboxN (không xoá file JWT)
+  ur-run-ur status    # Trạng thái containers
+  ur-run-ur logs      # Logs 30 phút gần nhất
+  ur-run-ur update    # Pull image thủ công
+
+ENV: IMAGE, SBOX_PREFIX, UR_PREFIX, JWT_DIR_BASE, PULL_ON_START,
+     LOG_MAX_SIZE, LOG_MAX_FILE, RECREATE_DELAY
+
+Gợi ý: nếu thiếu JWT, chạy:  ur-get-jwts up
+EOF
+}
+
+cmd_up(){
+  need docker
+  pull_image
+  local list; list="$(discover_sboxes)"
+  [[ -n "$list" ]] || die "Không tìm thấy ${SBOX_PREFIX}N nào."
+  info "Phát hiện routes:"; echo "$list" | xargs -I{} echo " - {}"
+  while read -r s; do run_or_restart_for_sbox "$s"; done <<< "$list"
+  info "✅ Hoàn tất."
+}
+cmd_down(){
+  need docker
+  docker ps -a --format '{{.Names}}' \
+    | awk -v pfx="^${UR_PREFIX}${SBOX_PREFIX}[0-9]+$" '$0 ~ pfx' \
+    | while read -r n; do docker rm -f "$n" >/dev/null 2>&1 && echo "✗ $n đã xoá" || true; done
+  info "[DONE] Đã dừng toàn bộ UR containers."
+}
+cmd_status(){
+  need docker
+  local list; list="$(discover_sboxes)"
+  [[ -n "$list" ]] || { info "Không thấy ${SBOX_PREFIX}N nào."; exit 0; }
+  printf "%-10s | %-14s | %-10s | %-8s\n" "SBOX" "CONTAINER" "STATUS" "JWT?"
+  echo "-----------------------------------------------------"
+  while read -r s; do
+    local cname; cname="$(container_name_for_sbox "$s")"
+    local st; st="$(docker inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || echo '-')"
+    local jwt_file; jwt_file="$(jwt_file_for_sbox "$s")"
+    local has="NO"; [[ -s "$jwt_file" ]] && has="YES"
+    printf "%-10s | %-14s | %-10s | %-8s\n" "$s" "$cname" "$st" "$has"
+  done <<< "$list"
+}
+cmd_logs(){
+  need docker
+  docker ps -a --format '{{.Names}}' \
+    | awk -v pfx="^${UR_PREFIX}${SBOX_PREFIX}[0-9]+$" '$0 ~ pfx' \
+    | while read -r n; do
+        echo "===== $n ====="
+        docker logs --since=30m -n 200 "$n" || true
+      done
+}
+cmd_update(){
+  need docker
+  info "Đang pull image: $IMAGE ..."
+  docker pull "$IMAGE" && info "✅ Pull xong. Chạy tiếp: ur-run-ur up" || die "Pull image lỗi."
+}
+
+case "${1:-}" in
+  up)       cmd_up ;;
+  down)     cmd_down ;;
+  status)   cmd_status ;;
+  logs)     cmd_logs ;;
+  update)   cmd_update ;;
+  ""|help|-h|--help) usage ;;
+  *) die "Lệnh không hợp lệ. Xem: ur-run-ur help" ;;
+esac
